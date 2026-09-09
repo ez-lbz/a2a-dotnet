@@ -608,6 +608,72 @@ public class TaskProjectionTests
     }
 
     [Fact]
+    public void Apply_WithStatusUpdate_DoesNotShareMetadataReferenceWithOriginal()
+    {
+        // Arrange
+        var originalMetadata = new Dictionary<string, JsonElement>
+        {
+            ["key"] = JsonSerializer.SerializeToElement("val")
+        };
+        var task = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "c1",
+            Status = new TaskStatus { State = TaskState.Working },
+            Metadata = originalMetadata
+        };
+
+        // Act
+        var result = TaskProjection.Apply(task, new StreamResponse
+        {
+            StatusUpdate = new TaskStatusUpdateEvent
+            {
+                Status = new TaskStatus { State = TaskState.Completed }
+            }
+        });
+
+        // Assert: projected task has its own Metadata dictionary instance
+        Assert.NotSame(originalMetadata, result!.Metadata);
+        Assert.Equal(originalMetadata.Count, result.Metadata!.Count);
+
+        // Assert: mutating the copy does not affect the original
+        result.Metadata["new"] = JsonSerializer.SerializeToElement("new-val");
+        Assert.Single(originalMetadata);
+    }
+
+    [Fact]
+    public void Apply_WithStatusUpdate_PreservesMetadataComparer()
+    {
+        // Arrange
+        var originalMetadata = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["key"] = JsonSerializer.SerializeToElement("val")
+        };
+        var task = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "c1",
+            Status = new TaskStatus { State = TaskState.Working },
+            Metadata = originalMetadata
+        };
+
+        // Act
+        var result = TaskProjection.Apply(task, new StreamResponse
+        {
+            StatusUpdate = new TaskStatusUpdateEvent
+            {
+                Status = new TaskStatus { State = TaskState.Completed }
+            }
+        });
+
+        // Assert: projected task's Metadata keeps a case-insensitive lookup working
+        Assert.True(result!.Metadata!.ContainsKey("KEY"));
+
+        // Assert: the comparer instance itself is preserved, not defaulted
+        Assert.Same(originalMetadata.Comparer, result.Metadata.Comparer);
+    }
+
+    [Fact]
     public void Apply_ReturnsNewAgentTaskInstance_OriginalUnmutated()
     {
         // Arrange
@@ -644,5 +710,119 @@ public class TaskProjectionTests
 
         // Assert — result has the updated state
         Assert.Equal(TaskState.Completed, result!.Status.State);
+    }
+
+    [Theory]
+    [InlineData(TaskState.Completed)]
+    [InlineData(TaskState.Canceled)]
+    [InlineData(TaskState.Failed)]
+    [InlineData(TaskState.Rejected)]
+    public void Apply_WithStatusUpdate_OnTerminalTask_Throws(TaskState terminalState)
+    {
+        // Arrange — a terminal task whose status must not be overwritten
+        var current = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = terminalState },
+        };
+        var evt = new StreamResponse
+        {
+            StatusUpdate = new TaskStatusUpdateEvent
+            {
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Status = new TaskStatus { State = TaskState.Submitted },
+            }
+        };
+
+        // Act & Assert — terminal → non-terminal transition is rejected
+        var ex = Assert.Throws<A2AException>(() => TaskProjection.Apply(current, evt));
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, ex.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData(TaskState.Completed)]
+    [InlineData(TaskState.Canceled)]
+    [InlineData(TaskState.Failed)]
+    [InlineData(TaskState.Rejected)]
+    public void Apply_WithStatusUpdate_SameTerminalState_Throws(TaskState terminalState)
+    {
+        // Arrange — even an idempotent re-emission of a terminal state is rejected;
+        // a terminal task is final and must be re-created rather than reused
+        var current = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = terminalState },
+        };
+        var evt = new StreamResponse
+        {
+            StatusUpdate = new TaskStatusUpdateEvent
+            {
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Status = new TaskStatus { State = terminalState },
+            }
+        };
+
+        // Act & Assert
+        var ex = Assert.Throws<A2AException>(() => TaskProjection.Apply(current, evt));
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, ex.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData(TaskState.Completed)]
+    [InlineData(TaskState.Canceled)]
+    [InlineData(TaskState.Failed)]
+    [InlineData(TaskState.Rejected)]
+    public void Apply_WithMessage_OnTerminalTask_Throws(TaskState terminalState)
+    {
+        // Arrange — a terminal task must not accept further messages
+        var current = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = terminalState },
+        };
+        var evt = new StreamResponse
+        {
+            Message = new Message { MessageId = "m1", Role = Role.Agent, Parts = [Part.FromText("late")] },
+        };
+
+        // Act & Assert
+        var ex = Assert.Throws<A2AException>(() => TaskProjection.Apply(current, evt));
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, ex.ErrorCode);
+    }
+
+    [Fact]
+    public void Apply_WithArtifactUpdate_OnTerminalTask_DoesNotThrow()
+    {
+        // Arrange — artifact updates after terminal are tolerated by the projection;
+        // only status/message mutations are guarded
+        var current = new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Completed },
+        };
+        var evt = new StreamResponse
+        {
+            ArtifactUpdate = new TaskArtifactUpdateEvent
+            {
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Append = false,
+                Artifact = new Artifact { ArtifactId = "a1", Parts = [Part.FromText("data")] },
+            }
+        };
+
+        // Act
+        var result = TaskProjection.Apply(current, evt);
+
+        // Assert
+        Assert.NotNull(result);
+        Assert.Equal(TaskState.Completed, result!.Status.State);
+        Assert.Single(result.Artifacts!);
     }
 }
