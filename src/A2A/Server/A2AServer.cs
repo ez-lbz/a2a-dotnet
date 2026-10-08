@@ -2,6 +2,7 @@ using A2A.Extensions;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
@@ -46,12 +47,19 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
     /// <summary>Cancels and awaits all background return-immediately drain tasks.</summary>
     public async ValueTask DisposeAsync()
     {
-        // Cancel all background work. Each drain's finally block owns its own
-        // dictionary removal and CTS disposal, so no cleanup needed here.
-        foreach (var cts in _backgroundCancellations.Values.ToArray())
+        // Cancel all background work. Completion cleanup owns dictionary removal
+        // and CTS disposal, so no cleanup is needed here.
+        foreach (var entry in _backgroundCancellations.ToArray())
         {
-            try { await cts.CancelAsync().ConfigureAwait(false); }
-            catch (ObjectDisposedException) { }
+            using (await _notifier.AcquireTaskLockAsync(entry.Key).ConfigureAwait(false))
+            {
+                if (_backgroundCancellations.TryGetValue(entry.Key, out var currentCts)
+                    && ReferenceEquals(currentCts, entry.Value))
+                {
+                    try { await currentCts.CancelAsync().ConfigureAwait(false); }
+                    catch (ObjectDisposedException) { }
+                }
+            }
         }
 
         await Task.WhenAll(_backgroundTasks.Values.ToArray()).ConfigureAwait(false);
@@ -72,16 +80,10 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         {
             A2ADiagnostics.RequestCount.Add(1);
 
+            ValidateMessage(request.Message);
             context = await ResolveContextAsync(request, streamingResponse: false, cancellationToken).ConfigureAwait(false);
             TagActivity(activity, context);
             GuardTerminalState(context);
-
-            if (context.IsContinuation && _options.AutoAppendHistory)
-            {
-                await ApplyEventAsync(
-                    new StreamResponse { Message = request.Message },
-                    context, cancellationToken).ConfigureAwait(false);
-            }
 
             bool returnImmediately = request.Configuration?.ReturnImmediately == true;
 
@@ -92,57 +94,19 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
             CancellationToken executionCancellationToken;
             if (returnImmediately)
             {
-                // NOTE: Concurrent SendMessage requests for the same TaskId is not a
-                // supported scenario by either the A2A protocol or this SDK. The atomic
-                // GetOrAdd pattern below is defense-in-depth — it prevents silent CTS
-                // orphaning if the unsupported scenario occurs, rather than enabling it.
-                var newCts = new CancellationTokenSource();
-                var cts = _backgroundCancellations.GetOrAdd(context.TaskId, newCts);
-
-                if (ReferenceEquals(cts, newCts))
-                {
-                    // We won the race — this drain will own CTS disposal.
-                    backgroundCts = newCts;
-                }
-                else
-                {
-                    // Another request already registered a CTS — reuse it.
-                    newCts.Dispose();
-                }
-
-                try
-                {
-                    executionCancellationToken = cts.Token;
-                }
-                catch (ObjectDisposedException)
-                {
-                    // The existing CTS was disposed by a completing drain — replace atomically.
-                    // Retry loop handles the race where an entry is added and removed between
-                    // our TryAdd and TryGetValue calls (same pattern as AcquireTaskLockAsync).
-                    backgroundCts = new CancellationTokenSource();
-                    while (true)
-                    {
-                        if (_backgroundCancellations.TryAdd(context.TaskId, backgroundCts))
-                        {
-                            executionCancellationToken = backgroundCts.Token;
-                            break;
-                        }
-
-                        if (_backgroundCancellations.TryGetValue(context.TaskId, out var current))
-                        {
-                            // Another thread inserted a fresh CTS — reuse it.
-                            backgroundCts.Dispose();
-                            backgroundCts = null;
-                            executionCancellationToken = current.Token;
-                            break;
-                        }
-
-                        // Both failed — entry was added and removed between our calls. Retry.
-                    }
-                }
+                (backgroundCts, executionCancellationToken) =
+                    await ReserveBackgroundOperationAsync(
+                        context, request.Message, cancellationToken).ConfigureAwait(false);
             }
             else
             {
+                if (context.IsContinuation && _options.AutoAppendHistory)
+                {
+                    await ApplyEventAsync(
+                        new StreamResponse { Message = request.Message },
+                        context, cancellationToken).ConfigureAwait(false);
+                }
+
                 executionCancellationToken = cancellationToken;
             }
 
@@ -156,7 +120,7 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                 {
                     eventQueue.Complete();
                 }
-            }, executionCancellationToken);
+            }, CancellationToken.None);
 
             if (returnImmediately)
             {
@@ -175,9 +139,10 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
             // Clean up orphaned background CTS if we registered one but never
             // reached the drain task that owns its removal and disposal.
             if (backgroundCts is not null && context is not null &&
-                _backgroundCancellations.TryRemove(context.TaskId, out _))
+                await ReleaseBackgroundCancellationAsync(
+                    context.TaskId, backgroundCts, CancellationToken.None).ConfigureAwait(false))
             {
-                backgroundCts.Dispose();
+                backgroundCts = null;
             }
 
             A2ADiagnostics.ErrorCount.Add(1);
@@ -201,6 +166,7 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         RequestContext? context = null;
         AgentEventQueue? eventQueue = null;
         Task? agentTask = null;
+        Task? backgroundReleaseTask = null;
         CancellationTokenSource? backgroundCts = null;
         CancellationToken backgroundCancellationToken = default;
         int eventCount = 0;
@@ -208,61 +174,23 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
 
         try
         {
+            if (!_options.SupportsStreaming)
+            {
+                throw new A2AException(
+                    "Streaming is not supported by this agent.",
+                    A2AErrorCode.UnsupportedOperation);
+            }
+
+            ValidateMessage(request.Message);
             context = await ResolveContextAsync(request, streamingResponse: true, cancellationToken).ConfigureAwait(false);
             TagActivity(activity, context);
             GuardTerminalState(context);
 
-            if (context.IsContinuation && _options.AutoAppendHistory)
-            {
-                await ApplyEventAsync(
-                    new StreamResponse { Message = request.Message },
-                    context, cancellationToken).ConfigureAwait(false);
-            }
-
             // Decouple handler lifetime from the HTTP connection: use a background CTS
             // that survives client disconnects and is cancellable via CancelTaskAsync.
-            var newCts = new CancellationTokenSource();
-            var cts = _backgroundCancellations.GetOrAdd(context.TaskId, newCts);
-
-            if (ReferenceEquals(cts, newCts))
-            {
-                backgroundCts = newCts;
-            }
-            else
-            {
-                newCts.Dispose();
-            }
-
-            try
-            {
-                backgroundCancellationToken = cts.Token;
-            }
-            catch (ObjectDisposedException)
-            {
-                // The existing CTS was disposed by a completing drain — replace atomically.
-                // Retry loop handles the race where an entry is added and removed between
-                // our TryAdd and TryGetValue calls (same pattern as AcquireTaskLockAsync).
-                backgroundCts = new CancellationTokenSource();
-                while (true)
-                {
-                    if (_backgroundCancellations.TryAdd(context.TaskId, backgroundCts))
-                    {
-                        backgroundCancellationToken = backgroundCts.Token;
-                        break;
-                    }
-
-                    if (_backgroundCancellations.TryGetValue(context.TaskId, out var current))
-                    {
-                        // Another thread inserted a fresh CTS — reuse it.
-                        backgroundCts.Dispose();
-                        backgroundCts = null;
-                        backgroundCancellationToken = current.Token;
-                        break;
-                    }
-
-                    // Both failed — entry was added and removed between our calls. Retry.
-                }
-            }
+            (backgroundCts, backgroundCancellationToken) =
+                await ReserveBackgroundOperationAsync(
+                    context, request.Message, cancellationToken).ConfigureAwait(false);
 
             eventQueue = new AgentEventQueue();
             agentTask = Task.Run(async () =>
@@ -275,14 +203,17 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                 {
                     eventQueue.Complete();
                 }
-            }, backgroundCancellationToken);
+            }, CancellationToken.None);
+            backgroundReleaseTask = ReleaseBackgroundCancellationWhenCompletedAsync(
+                context.TaskId, eventQueue, agentTask, backgroundCts!, CancellationToken.None);
         }
         catch (Exception ex)
         {
             if (backgroundCts is not null && context is not null &&
-                _backgroundCancellations.TryRemove(context.TaskId, out _))
+                await ReleaseBackgroundCancellationAsync(
+                    context.TaskId, backgroundCts, CancellationToken.None).ConfigureAwait(false))
             {
-                backgroundCts.Dispose();
+                backgroundCts = null;
             }
 
             A2ADiagnostics.ErrorCount.Add(1);
@@ -299,12 +230,21 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                 {
                     await ApplyEventAsync(response, context!, cancellationToken).ConfigureAwait(false);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // Caller-requested cancellation is not a failure: propagate it as
+                    // cancellation (classified by the caller token, not by exception type),
+                    // and let the finally block drain remaining events in the background.
+                    throw;
+                }
                 catch (Exception ex)
                 {
+                    // A failure to read or persist authoritative task state must surface
+                    // to the caller, not be converted into a normal end-of-stream (#495).
                     A2ADiagnostics.ErrorCount.Add(1);
                     activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                     RecordException(activity, ex);
-                    yield break;
+                    throw;
                 }
 
                 eventCount++;
@@ -327,8 +267,8 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                 var capturedContext = context;
                 var capturedEventQueue = eventQueue!;
                 var capturedAgentTask = agentTask;
-                var ownedBackgroundCts = backgroundCts;
                 var drainCancellationToken = backgroundCancellationToken;
+                var releaseTask = backgroundReleaseTask!;
 
                 var drainTask = Task.Run(async () =>
                 {
@@ -362,13 +302,10 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                     }
                     finally
                     {
+#pragma warning disable VSTHRD003 // Lifecycle cleanup intentionally awaits the independently started release task
+                        await releaseTask.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
                         _backgroundTasks.TryRemove(capturedContext.TaskId, out _);
-
-                        if (ownedBackgroundCts is not null)
-                        {
-                            _backgroundCancellations.TryRemove(capturedContext.TaskId, out _);
-                            ownedBackgroundCts.Dispose();
-                        }
                     }
                 }, CancellationToken.None);
 
@@ -379,11 +316,9 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                     (_, existingDrain) => Task.WhenAll(existingDrain, drainTask));
 #pragma warning restore CS4014, VSTHRD003
             }
-            else if (backgroundCts is not null && context is not null)
+            else if (backgroundReleaseTask is not null)
             {
-                // Stream completed normally — clean up background CTS
-                _backgroundCancellations.TryRemove(context.TaskId, out _);
-                backgroundCts.Dispose();
+                await backgroundReleaseTask.ConfigureAwait(false);
             }
         }
     }
@@ -419,53 +354,66 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         using var activity = A2ADiagnostics.Source.StartActivity("A2AServer.CancelTask", ActivityKind.Internal);
         activity?.SetTag("a2a.task.id", request.Id);
 
-        var task = await _taskStore.GetTaskAsync(request.Id, cancellationToken).ConfigureAwait(false)
-            ?? throw new A2AException($"Task '{request.Id}' not found.", A2AErrorCode.TaskNotFound);
-
-        if (task.Status.State.IsTerminal())
+        // Hold the per-task lock across the entire cancel operation. This makes the
+        // terminal-state check-then-act atomic with respect to concurrent mutations
+        // (message/send ApplyEventAsync) and serializes concurrent cancel requests:
+        // the loser of the race re-reads the now-terminal task and fails with
+        // TaskNotCancelable instead of double-cancelling.
+        // Events are applied via ApplyEventUnderLockAsync because the per-task
+        // semaphore is not reentrant.
+        using (await _notifier.AcquireTaskLockAsync(request.Id, cancellationToken).ConfigureAwait(false))
         {
-            throw new A2AException("Task is already in a terminal state.", A2AErrorCode.TaskNotCancelable);
-        }
+            var task = await _taskStore.GetTaskAsync(request.Id, cancellationToken).ConfigureAwait(false)
+                ?? throw new A2AException($"Task '{request.Id}' not found.", A2AErrorCode.TaskNotFound);
 
-        // Signal any background return-immediately work to stop.
-        // Don't dispose the CTS here — the drain's finally block owns disposal.
-        if (_backgroundCancellations.TryRemove(request.Id, out var backgroundCts))
-        {
-            await backgroundCts.CancelAsync().ConfigureAwait(false);
-        }
-
-        var context = new RequestContext
-        {
-            Message = task.History?.LastOrDefault() ?? new Message { Role = Role.User, MessageId = string.Empty, Parts = [] },
-            Task = task,
-            TaskId = task.Id,
-            ContextId = task.ContextId,
-            StreamingResponse = false,
-            Metadata = request.Metadata,
-        };
-
-        var eventQueue = new AgentEventQueue();
-        var agentTask = Task.Run(async () =>
-        {
-            try
+            if (task.Status.State.IsTerminal())
             {
-                await _handler.CancelAsync(context, eventQueue, cancellationToken).ConfigureAwait(false);
+                throw new A2AException("Task is already in a terminal state.", A2AErrorCode.TaskNotCancelable);
             }
-            finally
+
+            // Signal any background return-immediately work to stop.
+            // Keep the CTS registered while cancellation is in progress. Completion
+            // cleanup removes and disposes it after CancelAsync releases this lock.
+            if (_backgroundCancellations.TryGetValue(request.Id, out var backgroundCts))
             {
-                eventQueue.Complete();
+                await backgroundCts.CancelAsync().ConfigureAwait(false);
             }
-        }, cancellationToken);
 
-        await foreach (var response in eventQueue.WithCancellation(cancellationToken).ConfigureAwait(false))
-        {
-            await ApplyEventAsync(response, context, cancellationToken).ConfigureAwait(false);
+            var context = new RequestContext
+            {
+                Message = task.History?.LastOrDefault() ?? new Message { Role = Role.User, MessageId = string.Empty, Parts = [] },
+                Task = task,
+                TaskId = task.Id,
+                ContextId = task.ContextId,
+                StreamingResponse = false,
+                Metadata = request.Metadata,
+            };
+
+            var eventQueue = new AgentEventQueue();
+            var agentTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await _handler.CancelAsync(context, eventQueue, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    eventQueue.Complete();
+                }
+            }, CancellationToken.None);
+
+            await foreach (var response in eventQueue.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                await ApplyEventUnderLockAsync(
+                    response, context, cancellationToken, suppressConflictingTerminalStatus: true)
+                    .ConfigureAwait(false);
+            }
+
+            await agentTask.ConfigureAwait(false);
+
+            return await _taskStore.GetTaskAsync(request.Id, cancellationToken).ConfigureAwait(false)
+                ?? throw new A2AException($"Task '{request.Id}' not found.", A2AErrorCode.TaskNotFound);
         }
-
-        await agentTask.ConfigureAwait(false);
-
-        return await _taskStore.GetTaskAsync(request.Id, cancellationToken).ConfigureAwait(false)
-            ?? throw new A2AException($"Task '{request.Id}' not found.", A2AErrorCode.TaskNotFound);
     }
 
     /// <inheritdoc />
@@ -517,7 +465,7 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
 
     /// <inheritdoc />
     public virtual Task<TaskPushNotificationConfig> CreateTaskPushNotificationConfigAsync(
-        CreateTaskPushNotificationConfigRequest request, CancellationToken cancellationToken = default)
+        TaskPushNotificationConfig config, CancellationToken cancellationToken = default)
     {
         throw new A2AException("Push notifications not supported.", A2AErrorCode.PushNotificationNotSupported);
     }
@@ -530,8 +478,8 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
     }
 
     /// <inheritdoc />
-    public virtual Task<ListTaskPushNotificationConfigResponse> ListTaskPushNotificationConfigAsync(
-        ListTaskPushNotificationConfigRequest request, CancellationToken cancellationToken = default)
+    public virtual Task<ListTaskPushNotificationConfigsResponse> ListTaskPushNotificationConfigsAsync(
+        ListTaskPushNotificationConfigsRequest request, CancellationToken cancellationToken = default)
     {
         throw new A2AException("Push notifications not supported.", A2AErrorCode.PushNotificationNotSupported);
     }
@@ -547,7 +495,12 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
     public virtual Task<AgentCard> GetExtendedAgentCardAsync(
         GetExtendedAgentCardRequest request, CancellationToken cancellationToken = default)
     {
-        throw new A2AException("Extended agent card not configured.", A2AErrorCode.ExtendedAgentCardNotConfigured);
+        if (_options.SupportsExtendedAgentCard)
+        {
+            throw new A2AException("Extended agent card not configured.", A2AErrorCode.ExtendedAgentCardNotConfigured);
+        }
+
+        throw new A2AException("Extended agent card not supported.", A2AErrorCode.UnsupportedOperation);
     }
 
     // ─── Private Helpers ───
@@ -562,22 +515,25 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
     {
         try
         {
-            var task = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken).ConfigureAwait(false);
-            if (task is not null && !task.Status.State.IsTerminal())
+            using (await _notifier.AcquireTaskLockAsync(context.TaskId, cancellationToken).ConfigureAwait(false))
             {
-                await ApplyEventAsync(new StreamResponse
+                var task = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken).ConfigureAwait(false);
+                if (task is not null && !task.Status.State.IsTerminal())
                 {
-                    StatusUpdate = new TaskStatusUpdateEvent
+                    await ApplyEventUnderLockAsync(new StreamResponse
                     {
-                        TaskId = context.TaskId,
-                        ContextId = context.ContextId,
-                        Status = new TaskStatus
+                        StatusUpdate = new TaskStatusUpdateEvent
                         {
-                            State = TaskState.Failed,
-                            Timestamp = DateTimeOffset.UtcNow,
+                            TaskId = context.TaskId,
+                            ContextId = context.ContextId,
+                            Status = new TaskStatus
+                            {
+                                State = TaskState.Failed,
+                                Timestamp = DateTimeOffset.UtcNow,
+                            },
                         },
-                    },
-                }, context, cancellationToken).ConfigureAwait(false);
+                    }, context, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         catch (Exception innerEx)
@@ -597,6 +553,13 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         {
             existingTask = await _taskStore.GetTaskAsync(taskId, cancellationToken).ConfigureAwait(false)
                 ?? throw new A2AException($"Task '{taskId}' not found.", A2AErrorCode.TaskNotFound);
+            if (contextId is not null &&
+                !string.Equals(contextId, existingTask.ContextId, StringComparison.Ordinal))
+            {
+                throw new A2AException(
+                    $"Context '{contextId}' does not match task '{taskId}'.",
+                    A2AErrorCode.InvalidParams);
+            }
             contextId ??= existingTask.ContextId;
         }
 
@@ -613,6 +576,48 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         };
     }
 
+    private void ValidateMessage(Message message)
+    {
+        if (_options.SupportedInputModes.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var part in message.Parts)
+        {
+            if (part.MediaType is { } mediaType &&
+                !_options.SupportedInputModes.Any(mode => MediaTypeMatches(mode, mediaType)))
+            {
+                throw new A2AException(
+                    $"Content type '{mediaType}' is not supported.",
+                    A2AErrorCode.ContentTypeNotSupported);
+            }
+        }
+    }
+
+    private static bool MediaTypeMatches(string supported, string actual)
+    {
+        if (!MediaTypeHeaderValue.TryParse(supported, out var supportedHeader) ||
+            !MediaTypeHeaderValue.TryParse(actual, out var actualHeader) ||
+            supportedHeader.MediaType is not { } supportedMediaType ||
+            actualHeader.MediaType is not { } actualMediaType ||
+            actualMediaType.Contains('*'))
+        {
+            return false;
+        }
+
+        if (string.Equals(supportedMediaType, actualMediaType, StringComparison.OrdinalIgnoreCase) ||
+            supportedMediaType == "*/*")
+        {
+            return true;
+        }
+
+        var slash = supportedMediaType.IndexOf('/');
+        return slash > 0 &&
+            supportedMediaType.AsSpan(slash + 1).SequenceEqual("*") &&
+            actualMediaType.StartsWith(supportedMediaType.AsSpan(0, slash + 1), StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void GuardTerminalState(RequestContext context)
     {
         if (context.Task is not null && context.Task.Status.State.IsTerminal())
@@ -623,33 +628,179 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         }
     }
 
+    private async Task<(CancellationTokenSource? OwnedSource, CancellationToken Token)>
+        ReserveBackgroundOperationAsync(
+            RequestContext context,
+            Message incomingMessage,
+            CancellationToken cancellationToken)
+    {
+        using (await _notifier.AcquireTaskLockAsync(context.TaskId, cancellationToken).ConfigureAwait(false))
+        {
+            if (context.IsContinuation)
+            {
+                var currentTask = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken)
+                    .ConfigureAwait(false)
+                    ?? throw new A2AException(
+                        $"Task '{context.TaskId}' not found.",
+                        A2AErrorCode.TaskNotFound);
+
+                if (currentTask.Status.State.IsTerminal())
+                {
+                    throw new A2AException(
+                        "Task is in a terminal state and cannot accept messages.",
+                        A2AErrorCode.UnsupportedOperation);
+                }
+            }
+
+            var newCts = new CancellationTokenSource();
+            if (!_backgroundCancellations.TryAdd(context.TaskId, newCts))
+            {
+                newCts.Dispose();
+                throw new A2AException(
+                    $"Task '{context.TaskId}' already has a background operation.",
+                    A2AErrorCode.UnsupportedOperation);
+            }
+
+            try
+            {
+                if (context.IsContinuation && _options.AutoAppendHistory)
+                {
+                    await ApplyEventUnderLockAsync(
+                        new StreamResponse { Message = incomingMessage },
+                        context, cancellationToken).ConfigureAwait(false);
+                }
+
+                return (newCts, newCts.Token);
+            }
+            catch
+            {
+                TryRemoveBackgroundCancellation(context.TaskId, newCts);
+                newCts.Dispose();
+                throw;
+            }
+        }
+    }
+
+    private bool TryRemoveBackgroundCancellation(
+        string taskId,
+        CancellationTokenSource cancellation)
+        => ((ICollection<KeyValuePair<string, CancellationTokenSource>>)_backgroundCancellations)
+            .Remove(new KeyValuePair<string, CancellationTokenSource>(taskId, cancellation));
+
+    private async Task<bool> ReleaseBackgroundCancellationAsync(
+        string taskId,
+        CancellationTokenSource cancellation,
+        CancellationToken cancellationToken)
+    {
+        using (await _notifier.AcquireTaskLockAsync(taskId, cancellationToken).ConfigureAwait(false))
+        {
+            if (!TryRemoveBackgroundCancellation(taskId, cancellation))
+            {
+                return false;
+            }
+
+            cancellation.Dispose();
+            return true;
+        }
+    }
+
+    private async Task ReleaseBackgroundCancellationWhenCompletedAsync(
+        string taskId,
+        AgentEventQueue eventQueue,
+        Task agentTask,
+        CancellationTokenSource cancellation,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            try
+            {
+#pragma warning disable VSTHRD003 // Completion is intentionally observed by lifecycle cleanup
+                await eventQueue.Completion.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+            }
+            catch
+            {
+                // The stream consumer or background drain surfaces queue failures.
+            }
+
+            try
+            {
+#pragma warning disable VSTHRD003 // agentTask is intentionally observed by lifecycle cleanup
+                await agentTask.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+            }
+            catch
+            {
+                // The stream consumer or background drain surfaces handler failures.
+            }
+        }
+        finally
+        {
+            await ReleaseBackgroundCancellationAsync(taskId, cancellation, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
     private async Task ApplyEventAsync(
         StreamResponse response, RequestContext context, CancellationToken cancellationToken)
     {
         using (await _notifier.AcquireTaskLockAsync(context.TaskId, cancellationToken).ConfigureAwait(false))
         {
-            var currentTask = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken)
-                .ConfigureAwait(false);
-
-            var updatedTask = TaskProjection.Apply(currentTask, response);
-
-            // Message-only responses with no existing task have nothing to persist.
-            if (updatedTask is null)
-            {
-                _notifier.Notify(context.TaskId, response);
-                return;
-            }
-
-            if (currentTask is null)
-            {
-                A2ADiagnostics.TaskCreatedCount.Add(1);
-            }
-
-            await _taskStore.SaveTaskAsync(context.TaskId, updatedTask, cancellationToken)
-                .ConfigureAwait(false);
-
-            _notifier.Notify(context.TaskId, response);
+            await ApplyEventUnderLockAsync(response, context, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Applies an event to the task store while the caller holds the per-task lock.
+    /// Used by <see cref="ApplyEventAsync"/> and by <see cref="CancelTaskAsync"/>, which
+    /// holds the lock across the whole cancel operation to make the terminal-state
+    /// check-then-act atomic.
+    /// </summary>
+    /// <param name="response">The event to apply.</param>
+    /// <param name="context">The request context identifying the task.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="suppressConflictingTerminalStatus">
+    /// Whether a forced terminal update should silently lose to an already-persisted terminal state.
+    /// </param>
+    private async Task ApplyEventUnderLockAsync(
+        StreamResponse response,
+        RequestContext context,
+        CancellationToken cancellationToken,
+        bool suppressConflictingTerminalStatus = false)
+    {
+        var currentTask = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken)
+            .ConfigureAwait(false);
+
+        // A forced cancel can lose to a terminal state persisted outside this
+        // server's per-task lock. Preserve the first terminal state without
+        // weakening validation for normal handler events.
+        if (suppressConflictingTerminalStatus
+            && currentTask?.Status.State.IsTerminal() == true
+            && response.StatusUpdate is { } statusUpdate
+            && statusUpdate.Status.State != currentTask.Status.State)
+        {
+            return;
+        }
+
+        var updatedTask = TaskProjection.Apply(currentTask, response);
+
+        // Message-only responses with no existing task have nothing to persist.
+        if (updatedTask is null)
+        {
+            _notifier.Notify(context.TaskId, response);
+            return;
+        }
+
+        if (currentTask is null)
+        {
+            A2ADiagnostics.TaskCreatedCount.Add(1);
+        }
+
+        await _taskStore.SaveTaskAsync(context.TaskId, updatedTask, cancellationToken)
+            .ConfigureAwait(false);
+
+        _notifier.Notify(context.TaskId, response);
     }
 
     /// <summary>
@@ -729,8 +880,9 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
                     // for this request, not reused from an earlier return-immediately call).
                     if (ownedBackgroundCts is not null)
                     {
-                        _backgroundCancellations.TryRemove(context.TaskId, out _);
-                        ownedBackgroundCts.Dispose();
+                        await ReleaseBackgroundCancellationAsync(
+                            context.TaskId, ownedBackgroundCts, CancellationToken.None)
+                            .ConfigureAwait(false);
                     }
                 }
             }, CancellationToken.None);
@@ -745,6 +897,7 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
             // Re-fetch from store to return the current persisted state
             result.Task = await _taskStore.GetTaskAsync(context.TaskId, CancellationToken.None).ConfigureAwait(false)
                 ?? throw new A2AException($"Task '{context.TaskId}' not found after processing.", A2AErrorCode.TaskNotFound);
+            result.Task = result.Task.WithHistoryTrimmedTo(context.Configuration?.HistoryLength);
 
             return result;
         }
@@ -753,6 +906,13 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
 #pragma warning disable VSTHRD003 // Intentional: agentTask was started within SendMessageAsync
         await agentTask.ConfigureAwait(false);
 #pragma warning restore VSTHRD003
+
+        if (ownedBackgroundCts is not null)
+        {
+            await ReleaseBackgroundCancellationAsync(
+                context.TaskId, ownedBackgroundCts, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
 
         return result ?? throw new A2AException(
             "Agent handler did not produce any response events.",
@@ -763,10 +923,12 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         AgentEventQueue eventQueue, Task agentTask, RequestContext context, CancellationToken cancellationToken)
     {
         SendMessageResponse? result = null;
+        bool appliedTaskUpdate = false;
 
         await foreach (var response in eventQueue.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             await ApplyEventAsync(response, context, cancellationToken).ConfigureAwait(false);
+            appliedTaskUpdate |= response.StatusUpdate is not null || response.ArtifactUpdate is not null;
 
             // Capture the first Task or Message as the synchronous response
             if (result is null)
@@ -788,6 +950,7 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
         {
             result.Task = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken).ConfigureAwait(false)
                 ?? throw new A2AException($"Task '{context.TaskId}' not found after processing.", A2AErrorCode.TaskNotFound);
+            result.Task = result.Task.WithHistoryTrimmedTo(context.Configuration?.HistoryLength);
         }
 
         if (result is not null)
@@ -800,6 +963,22 @@ public class A2AServer : IA2ARequestHandler, IAsyncDisposable
 #pragma warning disable VSTHRD003 // Intentional: agentTask runs the agent handler on a background thread
         await agentTask.ConfigureAwait(false);
 #pragma warning restore VSTHRD003
+
+        // A continuation may legitimately emit only status/artifact updates.
+        // Those events are applied to the task store above, but they do not
+        // themselves populate `result`. Return the persisted task instead of
+        // reporting a completed continuation as an invalid agent response.
+        if (appliedTaskUpdate)
+        {
+            var persistedTask = await _taskStore.GetTaskAsync(context.TaskId, cancellationToken).ConfigureAwait(false);
+            if (persistedTask is not null)
+            {
+                return new SendMessageResponse
+                {
+                    Task = persistedTask.WithHistoryTrimmedTo(context.Configuration?.HistoryLength),
+                };
+            }
+        }
 
         throw new A2AException(
             "Agent handler did not produce any response events.",

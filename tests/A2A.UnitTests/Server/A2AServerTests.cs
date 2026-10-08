@@ -19,13 +19,50 @@ public class A2AServerTests
                ?? new TaskUpdater(eventQueue, context.TaskId, context.ContextId).CancelAsync(cancellationToken: cancellationToken).AsTask();
     }
 
+    private sealed class SignalingTaskStore(ITaskStore inner) : ITaskStore
+    {
+        private int _getCount;
+
+        public TaskCompletionSource FirstReadCompleted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<AgentTask?> GetTaskAsync(
+            string taskId,
+            CancellationToken cancellationToken = default)
+        {
+            var task = await inner.GetTaskAsync(taskId, cancellationToken);
+            if (Interlocked.Increment(ref _getCount) == 1)
+            {
+                FirstReadCompleted.TrySetResult();
+            }
+
+            return task;
+        }
+
+        public Task SaveTaskAsync(
+            string taskId,
+            AgentTask task,
+            CancellationToken cancellationToken = default)
+            => inner.SaveTaskAsync(taskId, task, cancellationToken);
+
+        public Task DeleteTaskAsync(
+            string taskId,
+            CancellationToken cancellationToken = default)
+            => inner.DeleteTaskAsync(taskId, cancellationToken);
+
+        public Task<ListTasksResponse> ListTasksAsync(
+            ListTasksRequest request,
+            CancellationToken cancellationToken = default)
+            => inner.ListTasksAsync(request, cancellationToken);
+    }
+
     private static (A2AServer server, InMemoryTaskStore store, TestAgentHandler handler)
-        CreateServer()
+        CreateServer(A2AServerOptions? options = null)
     {
         var notifier = new ChannelEventNotifier();
         var store = new InMemoryTaskStore();
         var handler = new TestAgentHandler();
-        var server = new A2AServer(handler, store, notifier, NullLogger<A2AServer>.Instance);
+        var server = new A2AServer(handler, store, notifier, NullLogger<A2AServer>.Instance, options);
         return (server, store, handler);
     }
 
@@ -115,6 +152,72 @@ public class A2AServerTests
     }
 
     [Fact]
+    public async Task GivenContinuation_WhenHandlerOnlyEmitsStatusUpdates_ThenFinalTaskIsReturned()
+    {
+        // A continuation can complete through status updates without
+        // emitting a second Task snapshot. It must still produce a response.
+        var (server, store, handler) = CreateServer();
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.InputRequired },
+        });
+
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            await new TaskUpdater(eq, ctx.TaskId, ctx.ContextId).CompleteAsync(cancellationToken: ct);
+            eq.Complete();
+        };
+
+        var result = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u2",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Parts = [Part.FromText("continue")],
+                Role = Role.User,
+            },
+        });
+
+        Assert.NotNull(result.Task);
+        Assert.Equal(TaskState.Completed, result.Task!.Status.State);
+    }
+
+    [Fact]
+    public async Task GivenContinuation_WhenHandlerEmitsNoEvents_ThenInvalidAgentResponseIsThrown()
+    {
+        var (server, store, handler) = CreateServer();
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.InputRequired },
+        });
+        handler.OnExecute = (ctx, eq, ct) =>
+        {
+            eq.Complete();
+            return Task.CompletedTask;
+        };
+
+        var ex = await Assert.ThrowsAsync<A2AException>(() => server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u2",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Parts = [Part.FromText("continue")],
+                Role = Role.User,
+            },
+        }));
+
+        Assert.Equal(A2AErrorCode.InvalidAgentResponse, ex.ErrorCode);
+    }
+
+    [Fact]
     public async Task GivenExistingTask_WhenSendMessage_ThenHistoryAppended()
     {
         // Arrange
@@ -153,6 +256,150 @@ public class A2AServerTests
         Assert.NotNull(task);
         Assert.NotNull(task!.History);
         Assert.Equal(3, task.History.Count);
+    }
+
+    [Fact]
+    public async Task GivenUnsupportedPartMediaType_WhenSendMessage_ThenThrowsContentTypeNotSupported()
+    {
+        var (server, _, _) = CreateServer(new A2AServerOptions
+        {
+            SupportedInputModes = ["text/plain"],
+        });
+
+        var exception = await Assert.ThrowsAsync<A2AException>(() =>
+            server.SendMessageAsync(new SendMessageRequest
+            {
+                Message = new Message
+                {
+                    MessageId = "u1",
+                    Role = Role.User,
+                    Parts =
+                    [
+                        new Part
+                        {
+                            Data = System.Text.Json.JsonSerializer.SerializeToElement("unsupported"),
+                            MediaType = "application/x-unsupported-type-12345",
+                        },
+                    ],
+                },
+            }));
+
+        Assert.Equal(A2AErrorCode.ContentTypeNotSupported, exception.ErrorCode);
+    }
+
+    [Fact]
+    public async Task GivenSupportedPartMediaTypeWithParameters_WhenSendMessage_ThenAcceptsMessage()
+    {
+        var (server, _, handler) = CreateServer(new A2AServerOptions
+        {
+            SupportedInputModes = ["text/plain"],
+        });
+        handler.OnExecute = async (context, eventQueue, cancellationToken) =>
+        {
+            await eventQueue.EnqueueMessageAsync(new Message
+            {
+                Role = Role.Agent,
+                MessageId = "a1",
+                ContextId = context.ContextId,
+                Parts = [Part.FromText("accepted")],
+            }, cancellationToken);
+            eventQueue.Complete();
+        };
+
+        var exception = await Record.ExceptionAsync(() =>
+            server.SendMessageAsync(new SendMessageRequest
+            {
+                Message = new Message
+                {
+                    MessageId = "u1",
+                    Role = Role.User,
+                    Parts = [new Part { Text = "hello", MediaType = "text/plain; charset=utf-8" }],
+                },
+            }));
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task GivenContinuationWithWrongContextId_WhenSendMessage_ThenThrowsInvalidParams()
+    {
+        var (server, store, _) = CreateServer();
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.InputRequired },
+        });
+
+        var exception = await Assert.ThrowsAsync<A2AException>(() =>
+            server.SendMessageAsync(new SendMessageRequest
+            {
+                Message = new Message
+                {
+                    MessageId = "u2",
+                    TaskId = "t1",
+                    ContextId = "wrong-context",
+                    Role = Role.User,
+                    Parts = [Part.FromText("continue")],
+                },
+            }));
+
+        Assert.Equal(A2AErrorCode.InvalidParams, exception.ErrorCode);
+    }
+
+    [Fact]
+    public async Task GivenHistoryLengthZero_WhenSendMessageReturnsTask_ThenResponseOmitsHistory()
+    {
+        var (server, _, handler) = CreateServer();
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            await eq.EnqueueTaskAsync(new AgentTask
+            {
+                Id = ctx.TaskId,
+                ContextId = ctx.ContextId,
+                Status = new TaskStatus { State = TaskState.Submitted },
+                History = [ctx.Message],
+            }, ct);
+            var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+            await updater.CompleteAsync(cancellationToken: ct);
+        };
+
+        var result = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                Role = Role.User,
+                Parts = [Part.FromText("hello")],
+            },
+            Configuration = new SendMessageConfiguration { HistoryLength = 0 },
+        });
+
+        Assert.NotNull(result.Task);
+        Assert.Empty(result.Task!.History ?? []);
+    }
+
+    [Fact]
+    public async Task GivenStreamingNotSupported_WhenSendStreamingMessage_ThenThrowsUnsupportedOperation()
+    {
+        var (server, _, _) = CreateServer(new A2AServerOptions { SupportsStreaming = false });
+
+        var exception = await Assert.ThrowsAsync<A2AException>(async () =>
+        {
+            await foreach (var _ in server.SendStreamingMessageAsync(new SendMessageRequest
+            {
+                Message = new Message
+                {
+                    MessageId = "u1",
+                    Role = Role.User,
+                    Parts = [Part.FromText("hello")],
+                },
+            }))
+            {
+            }
+        });
+
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, exception.ErrorCode);
     }
 
     [Fact]
@@ -290,6 +537,59 @@ public class A2AServerTests
         var ex = await Assert.ThrowsAsync<A2AException>(() =>
             server.CancelTaskAsync(new CancelTaskRequest { Id = "t1" }));
         Assert.Equal(A2AErrorCode.TaskNotCancelable, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task GivenWorkingTask_WhenTwoConcurrentCancels_ThenExactlyOneSucceeds()
+    {
+        // Arrange — two concurrent cancel requests race on the same task (TOCTOU).
+        // The per-task lock serializes check-then-act: the loser re-reads the now-terminal
+        // task and fails with TaskNotCancelable instead of double-cancelling.
+        var (server, store, handler) = CreateServer();
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Working },
+        });
+
+        handler.OnCancel = async (ctx, eq, ct) =>
+        {
+            // Slight delay so the two requests overlap inside the lock window
+            await Task.Delay(50, ct);
+            var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+            await updater.CancelAsync(cancellationToken: ct);
+        };
+
+        // Act — fire both cancels concurrently
+        var cancel1 = server.CancelTaskAsync(new CancelTaskRequest { Id = "t1" });
+        var cancel2 = server.CancelTaskAsync(new CancelTaskRequest { Id = "t1" });
+
+        var results = await Task.WhenAll(
+            RunCatchingAsync(cancel1),
+            RunCatchingAsync(cancel2));
+
+        // Assert — exactly one succeeds; the other sees the terminal state
+        var succeeded = results.Where(r => r.Item1).ToList();
+        var failed = results.Where(r => !r.Item1).ToList();
+
+        Assert.Single(succeeded);
+        Assert.Single(failed);
+        Assert.Equal(TaskState.Canceled, succeeded[0].Item2!.Status.State);
+        Assert.Equal(A2AErrorCode.TaskNotCancelable, failed[0].Item3!.ErrorCode);
+    }
+
+    private static async Task<(bool IsSuccess, AgentTask? Task, A2AException? Error)> RunCatchingAsync(Task<AgentTask> operation)
+    {
+        try
+        {
+            var task = await operation;
+            return (true, task, null);
+        }
+        catch (A2AException ex)
+        {
+            return (false, null, ex);
+        }
     }
 
     [Fact]
@@ -443,16 +743,40 @@ public class A2AServerTests
 
         // Act & Assert
         await Assert.ThrowsAsync<A2AException>(() =>
-            server.CreateTaskPushNotificationConfigAsync(new CreateTaskPushNotificationConfigRequest()));
+            server.CreateTaskPushNotificationConfigAsync(new TaskPushNotificationConfig()));
         await Assert.ThrowsAsync<A2AException>(() =>
             server.GetTaskPushNotificationConfigAsync(new GetTaskPushNotificationConfigRequest()));
     }
 
     [Fact]
-    public async Task GetExtendedAgentCard_ThrowsNotConfigured()
+    public async Task GetExtendedAgentCard_WhenCapabilityIsAbsent_ThrowsUnsupportedOperation()
     {
         // Arrange
         var (server, _, _) = CreateServer();
+
+        // Act & Assert
+        var ex = await Assert.ThrowsAsync<A2AException>(() =>
+            server.GetExtendedAgentCardAsync(new GetExtendedAgentCardRequest()));
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task GetExtendedAgentCard_WhenCapabilityIsFalse_ThrowsUnsupportedOperation()
+    {
+        // Arrange
+        var (server, _, _) = CreateServer(new A2AServerOptions { SupportsExtendedAgentCard = false });
+
+        // Act & Assert
+        var ex = await Assert.ThrowsAsync<A2AException>(() =>
+            server.GetExtendedAgentCardAsync(new GetExtendedAgentCardRequest()));
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task GetExtendedAgentCard_WhenCapabilityIsTrue_ThrowsNotConfigured()
+    {
+        // Arrange
+        var (server, _, _) = CreateServer(new A2AServerOptions { SupportsExtendedAgentCard = true });
 
         // Act & Assert
         var ex = await Assert.ThrowsAsync<A2AException>(() =>
@@ -683,6 +1007,60 @@ public class A2AServerTests
     }
 
     [Fact]
+    public async Task GivenSequentialReturnImmediatelyContinuations_WhenHandlersReturnMessages_ThenBothSucceed()
+    {
+        var (server, store, handler) = CreateServer(new A2AServerOptions { AutoAppendHistory = false });
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.InputRequired },
+        });
+        var invocation = 0;
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            var currentInvocation = Interlocked.Increment(ref invocation);
+            await eq.EnqueueMessageAsync(new Message
+            {
+                MessageId = $"m{currentInvocation}",
+                ContextId = ctx.ContextId,
+                TaskId = ctx.TaskId,
+                Role = Role.Agent,
+                Parts = [Part.FromText($"reply {currentInvocation}")],
+            }, ct);
+        };
+
+        var first = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Role = Role.User,
+                Parts = [Part.FromText("first")],
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        });
+        var second = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u2",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Role = Role.User,
+                Parts = [Part.FromText("second")],
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        });
+
+        Assert.Equal("reply 1", first.Message!.Parts[0].Text);
+        Assert.Equal("reply 2", second.Message!.Parts[0].Text);
+        Assert.Equal(2, invocation);
+    }
+
+    [Fact]
     public async Task GivenReturnImmediately_WhenHandlerCompletes_ThenBackgroundProcessingFinishes()
     {
         // Arrange
@@ -733,6 +1111,336 @@ public class A2AServerTests
         Assert.Equal(TaskState.Completed, persisted!.Status.State);
         Assert.NotNull(persisted.Artifacts);
         Assert.Contains(persisted.Artifacts!, a => a.ArtifactId == "a1");
+    }
+
+    [Fact]
+    public async Task GivenReturnImmediatelyContinuation_WhenTaskBecomesTerminalBeforeRegistration_ThenHandlerDoesNotStart()
+    {
+        var notifier = new ChannelEventNotifier();
+        var innerStore = new InMemoryTaskStore();
+        var store = new SignalingTaskStore(innerStore);
+        var handler = new TestAgentHandler();
+        var server = new A2AServer(
+            handler,
+            store,
+            notifier,
+            NullLogger<A2AServer>.Instance,
+            new A2AServerOptions { AutoAppendHistory = false });
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Working },
+        });
+
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.OnExecute = async (_, _, _) =>
+        {
+            handlerStarted.TrySetResult();
+            await releaseHandler.Task;
+        };
+
+        var heldLock = await notifier.AcquireTaskLockAsync("t1");
+        var sendTask = server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Parts = [Part.FromText("continue")],
+                Role = Role.User,
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        });
+
+        await store.FirstReadCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await innerStore.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Canceled },
+        });
+        heldLock.Dispose();
+        releaseHandler.TrySetResult();
+
+        var ex = await Record.ExceptionAsync(() => sendTask);
+
+        var a2aException = Assert.IsType<A2AException>(ex);
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, a2aException.ErrorCode);
+        Assert.False(handlerStarted.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task GivenOverlappingReturnImmediatelyContinuation_WhenBackgroundOperationExists_ThenSecondSendIsRejected()
+    {
+        var (server, store, handler) = CreateServer();
+        var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var invocation = 0;
+
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            if (Interlocked.Increment(ref invocation) == 1)
+            {
+                var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+                await updater.SubmitAsync(cancellationToken: ct);
+                await releaseFirstHandler.Task;
+                await updater.CompleteAsync(cancellationToken: ct);
+                return;
+            }
+
+            await eq.EnqueueMessageAsync(new Message
+            {
+                MessageId = "m2",
+                ContextId = ctx.ContextId,
+                TaskId = ctx.TaskId,
+                Role = Role.Agent,
+                Parts = [Part.FromText("overlap")],
+            }, ct);
+        };
+
+        var first = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                Role = Role.User,
+                Parts = [Part.FromText("start")],
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        });
+        Assert.NotNull(first.Task);
+
+        var ex = await Record.ExceptionAsync(() => server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u2",
+                TaskId = first.Task!.Id,
+                ContextId = first.Task.ContextId,
+                Role = Role.User,
+                Parts = [Part.FromText("continue")],
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        }));
+
+        releaseFirstHandler.TrySetResult();
+        await server.DisposeAsync();
+
+        var a2aException = Assert.IsType<A2AException>(ex);
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, a2aException.ErrorCode);
+        Assert.Equal(1, invocation);
+        var persisted = await store.GetTaskAsync(first.Task!.Id);
+        Assert.DoesNotContain(persisted!.History ?? [], message => message.MessageId == "u2");
+    }
+
+    [Fact]
+    public async Task GivenStreamingContinuation_WhenTaskBecomesTerminalBeforeRegistration_ThenHandlerDoesNotStart()
+    {
+        var notifier = new ChannelEventNotifier();
+        var innerStore = new InMemoryTaskStore();
+        var store = new SignalingTaskStore(innerStore);
+        var handler = new TestAgentHandler();
+        var server = new A2AServer(
+            handler,
+            store,
+            notifier,
+            NullLogger<A2AServer>.Instance,
+            new A2AServerOptions { AutoAppendHistory = false });
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Working },
+        });
+
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.OnExecute = async (_, _, _) =>
+        {
+            handlerStarted.TrySetResult();
+            await releaseHandler.Task;
+        };
+
+        var heldLock = await notifier.AcquireTaskLockAsync("t1");
+        await using var enumerator = server.SendStreamingMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Parts = [Part.FromText("continue")],
+                Role = Role.User,
+            },
+        }).GetAsyncEnumerator();
+        var moveNextTask = enumerator.MoveNextAsync().AsTask();
+
+        await store.FirstReadCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await innerStore.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Canceled },
+        });
+        heldLock.Dispose();
+        releaseHandler.TrySetResult();
+
+        var ex = await Record.ExceptionAsync(() => moveNextTask);
+
+        var a2aException = Assert.IsType<A2AException>(ex);
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, a2aException.ErrorCode);
+        Assert.False(handlerStarted.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task GivenStreamingHandlerEmitsUpdateAfterTerminalState_ThenInvalidUpdateIsNotYielded()
+    {
+        var (server, _, handler) = CreateServer();
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+            await updater.SubmitAsync(cancellationToken: ct);
+            await eq.EnqueueStatusUpdateAsync(new TaskStatusUpdateEvent
+            {
+                TaskId = ctx.TaskId,
+                ContextId = ctx.ContextId,
+                Status = new TaskStatus { State = TaskState.Completed },
+            }, ct);
+            await eq.EnqueueStatusUpdateAsync(new TaskStatusUpdateEvent
+            {
+                TaskId = ctx.TaskId,
+                ContextId = ctx.ContextId,
+                Status = new TaskStatus { State = TaskState.Working },
+            }, ct);
+        };
+
+        var states = new List<TaskState>();
+        var exception = await Record.ExceptionAsync(async () =>
+        {
+            await foreach (var response in server.SendStreamingMessageAsync(new SendMessageRequest
+            {
+                Message = new Message
+                {
+                    MessageId = "u1",
+                    Role = Role.User,
+                    Parts = [Part.FromText("start")],
+                },
+            }))
+            {
+                if (response.Task is not null)
+                {
+                    states.Add(response.Task.Status.State);
+                }
+                else if (response.StatusUpdate is not null)
+                {
+                    states.Add(response.StatusUpdate.Status.State);
+                }
+            }
+        });
+
+        var a2aException = Assert.IsType<A2AException>(exception);
+        Assert.Equal(A2AErrorCode.UnsupportedOperation, a2aException.ErrorCode);
+        Assert.Equal([TaskState.Submitted, TaskState.Completed], states);
+    }
+
+    [Fact]
+    public async Task GivenStreamingHandlerFinishesAtInputRequired_WhenConsumerPauses_ThenContinuationCanStart()
+    {
+        var (server, store, handler) = CreateServer(new A2AServerOptions { AutoAppendHistory = false });
+        await store.SaveTaskAsync("t1", new AgentTask
+        {
+            Id = "t1",
+            ContextId = "ctx-1",
+            Status = new TaskStatus { State = TaskState.Working },
+        });
+        var invocation = 0;
+        var allowFirstHandlerToFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstHandlerFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            if (Interlocked.Increment(ref invocation) == 1)
+            {
+                await eq.EnqueueStatusUpdateAsync(new TaskStatusUpdateEvent
+                {
+                    TaskId = ctx.TaskId,
+                    ContextId = ctx.ContextId,
+                    Status = new TaskStatus
+                    {
+                        State = TaskState.InputRequired,
+                        Message = new Message
+                        {
+                            MessageId = "prompt",
+                            TaskId = ctx.TaskId,
+                            ContextId = ctx.ContextId,
+                            Role = Role.Agent,
+                            Parts = [Part.FromText("more input")],
+                        },
+                    },
+                }, ct);
+                await allowFirstHandlerToFinish.Task;
+                firstHandlerFinished.TrySetResult();
+                return;
+            }
+
+            await eq.EnqueueMessageAsync(new Message
+            {
+                MessageId = "reply",
+                TaskId = ctx.TaskId,
+                ContextId = ctx.ContextId,
+                Role = Role.Agent,
+                Parts = [Part.FromText("continued")],
+            }, ct);
+        };
+
+        await using var enumerator = server.SendStreamingMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                TaskId = "t1",
+                ContextId = "ctx-1",
+                Role = Role.User,
+                Parts = [Part.FromText("first")],
+            },
+        }).GetAsyncEnumerator();
+
+        Assert.True(await enumerator.MoveNextAsync());
+        Assert.Equal(TaskState.InputRequired, enumerator.Current.StatusUpdate!.Status.State);
+
+        allowFirstHandlerToFinish.TrySetResult();
+        await firstHandlerFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        SendMessageResponse? continuation = null;
+        for (var attempt = 0; attempt < 50 && continuation is null; attempt++)
+        {
+            try
+            {
+                continuation = await server.SendMessageAsync(new SendMessageRequest
+                {
+                    Message = new Message
+                    {
+                        MessageId = "u2",
+                        TaskId = "t1",
+                        ContextId = "ctx-1",
+                        Role = Role.User,
+                        Parts = [Part.FromText("second")],
+                    },
+                    Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+                });
+            }
+            catch (A2AException ex) when (ex.ErrorCode == A2AErrorCode.UnsupportedOperation)
+            {
+                await Task.Delay(1);
+            }
+        }
+
+        Assert.NotNull(continuation);
+        Assert.Equal("continued", continuation.Message!.Parts[0].Text);
+        Assert.Equal(2, invocation);
     }
 
     [Fact]
@@ -828,6 +1536,71 @@ public class A2AServerTests
         var persisted = await store.GetTaskAsync(taskId);
         Assert.NotNull(persisted);
         Assert.Equal(TaskState.Canceled, persisted!.Status.State);
+    }
+
+    [Fact]
+    public async Task GivenBackgroundCancellationInProgress_WhenHandlerFinishes_ThenSourceIsNotDisposedEarly()
+    {
+        var (server, _, handler) = CreateServer();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerCancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockingCallbackStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseBlockingCallback = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Exception? callbackException = null;
+
+        handler.OnExecute = async (ctx, eq, ct) =>
+        {
+            var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+            await updater.SubmitAsync(cancellationToken: ct);
+            await updater.StartWorkAsync(cancellationToken: ct);
+
+            using var blockingRegistration = ct.Register(() =>
+            {
+                blockingCallbackStarted.TrySetResult();
+                releaseBlockingCallback.Task.GetAwaiter().GetResult();
+                try
+                {
+                    using var registrationAfterCancellation = ct.Register(static () => { });
+                }
+                catch (Exception ex)
+                {
+                    callbackException = ex;
+                }
+            });
+            using var handlerRegistration = ct.Register(() => handlerCancellation.TrySetResult());
+            handlerStarted.TrySetResult();
+            await handlerCancellation.Task;
+            handlerEnded.TrySetResult();
+        };
+        handler.OnCancel = async (ctx, eq, ct) =>
+        {
+            var updater = new TaskUpdater(eq, ctx.TaskId, ctx.ContextId);
+            await updater.CancelAsync(cancellationToken: ct);
+        };
+
+        var sendResult = await server.SendMessageAsync(new SendMessageRequest
+        {
+            Message = new Message
+            {
+                MessageId = "u1",
+                Role = Role.User,
+                Parts = [Part.FromText("start")],
+            },
+            Configuration = new SendMessageConfiguration { ReturnImmediately = true },
+        });
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var cancelTask = server.CancelTaskAsync(new CancelTaskRequest { Id = sendResult.Task!.Id });
+        await blockingCallbackStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await handlerEnded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+        releaseBlockingCallback.TrySetResult();
+
+        var canceledTask = await cancelTask;
+
+        Assert.Null(callbackException);
+        Assert.Equal(TaskState.Canceled, canceledTask.Status.State);
     }
 
     [Fact]

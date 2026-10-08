@@ -140,7 +140,7 @@ public class JsonRpcRequestConverterTests
     [InlineData(A2AMethods.SubscribeToTask)]
     [InlineData(A2AMethods.CreateTaskPushNotificationConfig)]
     [InlineData(A2AMethods.GetTaskPushNotificationConfig)]
-    [InlineData(A2AMethods.ListTaskPushNotificationConfig)]
+    [InlineData(A2AMethods.ListTaskPushNotificationConfigs)]
     [InlineData(A2AMethods.DeleteTaskPushNotificationConfig)]
     [InlineData(A2AMethods.GetExtendedAgentCard)]
     public void Read_ValidMethods_ReturnsCorrectMethod(string method)
@@ -254,7 +254,7 @@ public class JsonRpcRequestConverterTests
     [InlineData("\"invalid/method\"")]
     [InlineData("\"unknown\"")]
     [InlineData("\"message/send\"")]
-    public void Read_InvalidMethod_ThrowsA2AException(string methodJson)
+    public void Read_NonStandardMethod_PreservesMethodForExtensionDispatch(string methodJson)
     {
         // Arrange
         var json = $$"""
@@ -265,12 +265,12 @@ public class JsonRpcRequestConverterTests
         }
         """;
 
-        // Act & Assert
-        var exception = Assert.Throws<A2AException>(() =>
-            JsonSerializer.Deserialize<JsonRpcRequest>(json, _options));
+        // Act
+        var request = JsonSerializer.Deserialize<JsonRpcRequest>(json, _options);
 
-        Assert.Equal(A2AErrorCode.MethodNotFound, exception.ErrorCode);
-        Assert.Contains("not a valid A2A method", exception.Message);
+        // Assert
+        Assert.NotNull(request);
+        Assert.Equal(JsonSerializer.Deserialize<string>(methodJson), request.Method);
     }
 
     [Theory]
@@ -489,7 +489,7 @@ public class JsonRpcRequestConverterTests
     [InlineData(A2AMethods.SubscribeToTask)]
     [InlineData(A2AMethods.CreateTaskPushNotificationConfig)]
     [InlineData(A2AMethods.GetTaskPushNotificationConfig)]
-    [InlineData(A2AMethods.ListTaskPushNotificationConfig)]
+    [InlineData(A2AMethods.ListTaskPushNotificationConfigs)]
     [InlineData(A2AMethods.DeleteTaskPushNotificationConfig)]
     [InlineData(A2AMethods.GetExtendedAgentCard)]
     public void RoundTrip_AllValidMethods_PreservesMethod(string method)
